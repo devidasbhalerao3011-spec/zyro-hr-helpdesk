@@ -1,6 +1,5 @@
 
 import streamlit as st
-import time
 import uuid
 from rag_pipeline import build_rag
 
@@ -24,25 +23,21 @@ st.set_page_config(
 st.markdown("""
 <style>
 
-/* Main application */
 .stApp {
     background-color: #F5F7FB;
     color: #172033;
 }
 
-/* Remove default header */
 header[data-testid="stHeader"] {
     background: transparent;
 }
 
-/* Main content */
 .block-container {
     max-width: 1150px;
     padding-top: 2rem;
     padding-bottom: 3rem;
 }
 
-/* Sidebar */
 section[data-testid="stSidebar"] {
     background-color: #111827;
     border-right: 1px solid #253247;
@@ -52,7 +47,6 @@ section[data-testid="stSidebar"] * {
     color: #E5E7EB;
 }
 
-/* Sidebar buttons */
 section[data-testid="stSidebar"] button {
     background-color: #1F2937;
     border: 1px solid #374151;
@@ -67,13 +61,11 @@ section[data-testid="stSidebar"] button:hover {
     border-color: #60A5FA;
 }
 
-/* Headings */
 h1, h2, h3 {
     color: #172033 !important;
     font-weight: 700 !important;
 }
 
-/* Welcome banner */
 .hero {
     background: linear-gradient(120deg, #172554, #1D4ED8);
     padding: 32px;
@@ -94,7 +86,6 @@ h1, h2, h3 {
     font-size: 15px;
 }
 
-/* Quick action cards */
 div.stButton > button {
     border-radius: 12px;
     border: 1px solid #E1E7F0;
@@ -112,7 +103,6 @@ div.stButton > button:hover {
     background: #EFF6FF;
 }
 
-/* Chat messages */
 div[data-testid="stChatMessage"] {
     background: white;
     border: 1px solid #E6EAF0;
@@ -122,13 +112,11 @@ div[data-testid="stChatMessage"] {
     box-shadow: 0 3px 12px rgba(15, 23, 42, 0.03);
 }
 
-/* Chat input */
 div[data-testid="stChatInput"] {
     background: white;
     border-radius: 15px;
 }
 
-/* Citation container */
 .citation {
     background: #EFF6FF;
     border-left: 4px solid #2563EB;
@@ -139,7 +127,6 @@ div[data-testid="stChatInput"] {
     margin-top: 10px;
 }
 
-/* Status badge */
 .status {
     display: inline-block;
     background: #DCFCE7;
@@ -150,7 +137,6 @@ div[data-testid="stChatInput"] {
     font-weight: 600;
 }
 
-/* Footer */
 .footer {
     text-align: center;
     color: #94A3B8;
@@ -158,7 +144,6 @@ div[data-testid="stChatInput"] {
     padding: 25px 0;
 }
 
-/* HR divider */
 hr {
     border-color: #E5EAF2;
 }
@@ -218,6 +203,7 @@ def create_new_chat():
         "title": "New conversation",
         "messages": []
     })
+
     st.session_state.active_chat = len(st.session_state.chats) - 1
     st.session_state.pending_question = None
 
@@ -231,6 +217,37 @@ def set_question(question):
     st.session_state.pending_question = question
 
 
+def build_chat_export(chat):
+    lines = [
+        "ZYRO DYNAMICS - HR ASSISTANT CHAT",
+        "=" * 40,
+        f"Conversation: {chat['title']}",
+        ""
+    ]
+
+    for message in chat["messages"]:
+        role = message["role"].upper()
+
+        lines.append(f"{role}:")
+        lines.append(message["content"])
+
+        if message["role"] == "assistant":
+            sources = message.get("sources", [])
+
+            if sources:
+                lines.append("Sources:")
+                lines.extend(f"- {source}" for source in sources)
+
+        lines.append("")
+
+    lines.append(
+        "Disclaimer: AI-generated responses should be verified "
+        "with the HR team before making official decisions."
+    )
+
+    return "\n".join(lines)
+
+
 def process_question(question):
     question = question.strip()
 
@@ -239,17 +256,16 @@ def process_question(question):
 
     chat = get_current_chat()
 
-    # Add user question
     chat["messages"].append({
         "role": "user",
         "content": question
     })
 
-    # Set conversation title from first question
     if chat["title"] == "New conversation":
-        chat["title"] = question[:35] + ("..." if len(question) > 35 else "")
+        chat["title"] = question[:35] + (
+            "..." if len(question) > 35 else ""
+        )
 
-    # Generate response
     try:
         with st.spinner("Zyro Assistant is thinking..."):
             answer, sources = rag.ask(question)
@@ -263,7 +279,10 @@ def process_question(question):
     except Exception as e:
         chat["messages"].append({
             "role": "assistant",
-            "content": "I'm sorry, something went wrong while processing your question. Please try again.",
+            "content": (
+                "I'm sorry, something went wrong while processing "
+                "your question. Please try again."
+            ),
             "sources": []
         })
 
@@ -289,7 +308,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    if st.button("＋  New Chat", use_container_width=True):
+    if st.button("＋ New Chat", use_container_width=True):
         create_new_chat()
         st.rerun()
 
@@ -305,6 +324,18 @@ with st.sidebar:
         ):
             select_chat(i)
             st.rerun()
+
+    # Download current conversation
+    current_chat = get_current_chat()
+
+    st.download_button(
+        label="⬇ Download Current Chat",
+        data=build_chat_export(current_chat),
+        file_name="zyro_hr_chat.txt",
+        mime="text/plain",
+        use_container_width=True,
+        disabled=len(current_chat["messages"]) == 0
+    )
 
     st.markdown("---")
 
@@ -445,7 +476,6 @@ if not chat["messages"]:
                 st.rerun()
 
     st.markdown("---")
-
     st.markdown("### Suggested questions")
 
     suggestions = [
