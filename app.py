@@ -1,510 +1,603 @@
 
 import streamlit as st
+import sqlite3
+import json
 import uuid
-from rag_pipeline import build_rag
+import os
+from datetime import datetime
+from pathlib import Path
+
+from config import get_settings
+from src.rag_chain import build_rag_pipeline, answer_question
+from src.document_loader import load_policy_documents
+from src.text_splitter import split_documents
+from src.vector_store import get_vector_store
+from src.retriever import get_retriever
 
 
-# --------------------------------------------------
+# =========================================================
 # PAGE CONFIGURATION
-# --------------------------------------------------
+# =========================================================
 
 st.set_page_config(
-    page_title="Zyro HR Assistant",
-    page_icon="💼",
+    page_title="Zyro Dynamics | HR Assistant",
+    page_icon="💠",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
-# --------------------------------------------------
-# PREMIUM LIGHT THEME CSS
-# --------------------------------------------------
+# =========================================================
+# DATABASE: PERSISTENT CHAT HISTORY AND FEEDBACK
+# =========================================================
+
+DB_PATH = Path(__file__).parent / "chat_history.db"
+
+
+def get_db():
+    return sqlite3.connect(DB_PATH)
+
+
+def initialize_database():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sources TEXT,
+                feedback TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(chat_id) REFERENCES chats(id)
+            )
+        """)
+
+
+def create_chat():
+    chat_id = str(uuid.uuid4())
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO chats (id, title, created_at) VALUES (?, ?, ?)",
+            (
+                chat_id,
+                "New conversation",
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+
+    return chat_id
+
+
+def get_all_chats():
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT id, title FROM chats ORDER BY created_at DESC"
+        ).fetchall()
+
+
+def get_chat_messages(chat_id):
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, role, content, sources, feedback
+            FROM messages
+            WHERE chat_id = ?
+            ORDER BY created_at ASC
+            """,
+            (chat_id,),
+        ).fetchall()
+
+    messages = []
+
+    for row in rows:
+        messages.append({
+            "id": row[0],
+            "role": row[1],
+            "content": row[2],
+            "sources": json.loads(row[3] or "[]"),
+            "feedback": row[4],
+        })
+
+    return messages
+
+
+def save_message(chat_id, role, content, sources=None):
+    message_id = str(uuid.uuid4())
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO messages
+            (id, chat_id, role, content, sources, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                chat_id,
+                role,
+                content,
+                json.dumps(sources or []),
+                datetime.now().isoformat(timespec="microseconds"),
+            ),
+        )
+
+    return message_id
+
+
+def update_chat_title(chat_id, question):
+    title = question.strip().replace("\n", " ")
+
+    if len(title) > 42:
+        title = title[:39] + "..."
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE chats SET title = ? WHERE id = ?",
+            (title or "New conversation", chat_id),
+        )
+
+
+def save_feedback(message_id, feedback):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE messages SET feedback = ? WHERE id = ?",
+            (feedback, message_id),
+        )
+
+
+def clear_chat_messages(chat_id):
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE chat_id = ?",
+            (chat_id,),
+        )
+        conn.execute(
+            "UPDATE chats SET title = ? WHERE id = ?",
+            ("New conversation", chat_id),
+        )
+
+
+initialize_database()
+
+
+# =========================================================
+# CUSTOM CSS
+# =========================================================
 
 st.markdown("""
 <style>
 
-.stApp {
-    background-color: #F5F7FB;
-    color: #172033;
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
 }
 
-header[data-testid="stHeader"] {
-    background: transparent;
+.stApp {
+    background: #F5F7FC;
+    color: #172B4D;
 }
 
 .block-container {
-    max-width: 1150px;
-    padding-top: 2rem;
+    padding-top: 1.5rem;
     padding-bottom: 3rem;
+    max-width: 1100px;
 }
 
+/* Sidebar */
+
 section[data-testid="stSidebar"] {
-    background-color: #111827;
-    border-right: 1px solid #253247;
+    background: #12213D;
 }
 
 section[data-testid="stSidebar"] * {
-    color: #E5E7EB;
+    color: #FFFFFF;
 }
 
-section[data-testid="stSidebar"] button {
-    background-color: #1F2937;
-    border: 1px solid #374151;
-    border-radius: 10px;
+section[data-testid="stSidebar"] .stButton button {
+    background: #1D3153;
+    border: 1px solid #344B70;
     color: white;
-    width: 100%;
+    border-radius: 10px;
     text-align: left;
 }
 
-section[data-testid="stSidebar"] button:hover {
-    background-color: #26364D;
-    border-color: #60A5FA;
+section[data-testid="stSidebar"] .stButton button:hover {
+    background: #29456F;
+    border-color: #6E9BE5;
 }
 
-h1, h2, h3 {
-    color: #172033 !important;
-    font-weight: 700 !important;
+/* Logo */
+
+.zyro-logo {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    padding: 12px 0 22px 0;
 }
+
+.zyro-mark {
+    width: 48px;
+    height: 48px;
+    border-radius: 15px;
+    background: linear-gradient(135deg, #4F8DF7, #2455C7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-family: 'Manrope', sans-serif;
+    font-size: 26px;
+    font-weight: 800;
+    box-shadow: 0 5px 15px rgba(35, 90, 190, 0.25);
+}
+
+.zyro-name {
+    font-family: 'Manrope', sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    letter-spacing: 1px;
+    color: #172B4D;
+}
+
+.zyro-subtitle {
+    color: #7890B2;
+    font-size: 10px;
+    letter-spacing: 2px;
+    font-weight: 600;
+}
+
+/* Welcome banner */
 
 .hero {
-    background: linear-gradient(120deg, #172554, #1D4ED8);
-    padding: 32px;
-    border-radius: 20px;
+    background: linear-gradient(115deg, #172F57, #2757A5);
+    padding: 34px;
+    border-radius: 22px;
     color: white;
     margin-bottom: 25px;
-    box-shadow: 0 8px 24px rgba(30, 64, 175, 0.12);
+    box-shadow: 0 12px 30px rgba(30, 70, 130, 0.12);
 }
 
 .hero h1 {
-    color: white !important;
+    color: white;
+    font-family: 'Manrope', sans-serif;
     font-size: 30px;
+    font-weight: 800;
     margin-bottom: 8px;
 }
 
 .hero p {
-    color: #DBEAFE;
-    font-size: 15px;
+    color: #D9E7FF;
+    font-size: 14px;
 }
 
-div.stButton > button {
+/* Quick action cards */
+
+div[data-testid="stButton"] button {
     border-radius: 12px;
-    border: 1px solid #E1E7F0;
-    background: white;
-    color: #172033;
-    padding: 12px 16px;
-    min-height: 55px;
-    transition: all 0.2s ease;
     font-weight: 600;
+    min-height: 43px;
 }
 
-div.stButton > button:hover {
-    border-color: #2563EB;
-    color: #2563EB;
-    background: #EFF6FF;
-}
+/* Chat messages */
 
 div[data-testid="stChatMessage"] {
     background: white;
-    border: 1px solid #E6EAF0;
-    border-radius: 16px;
-    padding: 16px;
+    border: 1px solid #E7ECF5;
+    border-radius: 15px;
+    padding: 15px;
     margin-bottom: 12px;
-    box-shadow: 0 3px 12px rgba(15, 23, 42, 0.03);
+    box-shadow: 0 3px 12px rgba(25, 45, 80, 0.035);
 }
+
+/* Disclaimer */
+
+.hr-disclaimer {
+    background: #FFF8E8;
+    border: 1px solid #F1D89C;
+    border-left: 4px solid #D69B24;
+    padding: 13px 16px;
+    border-radius: 10px;
+    margin: 12px 0 16px 0;
+    color: #745719;
+    font-size: 12px;
+}
+
+/* Feedback */
+
+.feedback-label {
+    font-size: 12px;
+    color: #71809A;
+    margin-top: 8px;
+}
+
+/* Sources */
+
+div[data-testid="stExpander"] {
+    border: 1px solid #E1E8F3;
+    border-radius: 10px;
+    background: white;
+}
+
+/* Input */
 
 div[data-testid="stChatInput"] {
-    background: white;
-    border-radius: 15px;
+    border-radius: 14px;
 }
 
-.citation {
-    background: #EFF6FF;
-    border-left: 4px solid #2563EB;
-    padding: 12px 15px;
-    border-radius: 8px;
-    color: #1E3A8A;
-    font-size: 13px;
-    margin-top: 10px;
-}
-
-.status {
-    display: inline-block;
-    background: #DCFCE7;
-    color: #166534;
-    padding: 5px 12px;
-    border-radius: 20px;
-    font-size: 12px;
-    font-weight: 600;
-}
+/* Footer */
 
 .footer {
     text-align: center;
-    color: #94A3B8;
-    font-size: 12px;
-    padding: 25px 0;
-}
-
-hr {
-    border-color: #E5EAF2;
+    color: #91A0B8;
+    font-size: 11px;
+    padding: 25px 0 10px 0;
 }
 
 </style>
 """, unsafe_allow_html=True)
 
 
-# --------------------------------------------------
-# SESSION STATE
-# --------------------------------------------------
+# =========================================================
+# LOGO AND BRANDING
+# =========================================================
 
-if "chats" not in st.session_state:
-    st.session_state.chats = [
-        {
-            "id": str(uuid.uuid4()),
-            "title": "New conversation",
-            "messages": []
-        }
-    ]
+def show_logo():
+    st.markdown("""
+    <div class="zyro-logo">
+        <div class="zyro-mark">Z</div>
+        <div>
+            <div class="zyro-name">ZYRO DYNAMICS</div>
+            <div class="zyro-subtitle">PEOPLE & HR ASSISTANT</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# =========================================================
+# LOAD RAG PIPELINE
+# =========================================================
+
+@st.cache_resource(show_spinner="Loading HR policy knowledge base...")
+def load_pipeline():
+    settings = get_settings()
+
+    docs = load_policy_documents(
+        settings.pdf_dir,
+        expected_count=settings.expected_pdf_count
+    )
+
+    chunks = split_documents(
+        docs,
+        settings.chunk_size,
+        settings.chunk_overlap
+    )
+
+    store = get_vector_store(chunks, settings)
+    retriever = get_retriever(store, settings)
+    chain = build_rag_pipeline(settings)
+
+    return retriever, chain
+
+
+try:
+    retriever, chain = load_pipeline()
+
+except Exception:
+    st.error(
+        "Could not initialize the HR knowledge base. "
+        "Please check the policy PDFs, configuration and model credentials."
+    )
+
+    if os.getenv("DEBUG", "").lower() == "true":
+        st.exception(Exception("Knowledge base initialization failed."))
+
+    st.stop()
+
+
+# =========================================================
+# SESSION STATE
+# =========================================================
 
 if "active_chat" not in st.session_state:
-    st.session_state.active_chat = 0
+    chats = get_all_chats()
+
+    if chats:
+        st.session_state.active_chat = chats[0][0]
+    else:
+        st.session_state.active_chat = create_chat()
+
 
 if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
 
 
-# --------------------------------------------------
-# RAG BACKEND
-# --------------------------------------------------
-
-@st.cache_resource
-def load_rag():
-    return build_rag()
-
-
-try:
-    rag = load_rag()
-except Exception as e:
-    st.error("Unable to initialize the HR Assistant.")
-    st.exception(e)
-    st.stop()
-
-
-# --------------------------------------------------
-# HELPER FUNCTIONS
-# --------------------------------------------------
-
-def get_current_chat():
-    return st.session_state.chats[st.session_state.active_chat]
-
-
-def create_new_chat():
-    st.session_state.chats.append({
-        "id": str(uuid.uuid4()),
-        "title": "New conversation",
-        "messages": []
-    })
-
-    st.session_state.active_chat = len(st.session_state.chats) - 1
-    st.session_state.pending_question = None
-
-
-def select_chat(index):
-    st.session_state.active_chat = index
-    st.session_state.pending_question = None
-
-
-def set_question(question):
-    st.session_state.pending_question = question
-
-
-def build_chat_export(chat):
-    lines = [
-        "ZYRO DYNAMICS - HR ASSISTANT CHAT",
-        "=" * 40,
-        f"Conversation: {chat['title']}",
-        ""
-    ]
-
-    for message in chat["messages"]:
-        role = message["role"].upper()
-
-        lines.append(f"{role}:")
-        lines.append(message["content"])
-
-        if message["role"] == "assistant":
-            sources = message.get("sources", [])
-
-            if sources:
-                lines.append("Sources:")
-                lines.extend(f"- {source}" for source in sources)
-
-        lines.append("")
-
-    lines.append(
-        "Disclaimer: AI-generated responses should be verified "
-        "with the HR team before making official decisions."
-    )
-
-    return "\n".join(lines)
-
-
-def process_question(question):
-    question = question.strip()
-
-    if not question:
-        return
-
-    chat = get_current_chat()
-
-    chat["messages"].append({
-        "role": "user",
-        "content": question
-    })
-
-    if chat["title"] == "New conversation":
-        chat["title"] = question[:35] + (
-            "..." if len(question) > 35 else ""
-        )
-
-    try:
-        with st.spinner("Zyro Assistant is thinking..."):
-            answer, sources = rag.ask(question)
-
-        chat["messages"].append({
-            "role": "assistant",
-            "content": answer,
-            "sources": sources
-        })
-
-    except Exception as e:
-        chat["messages"].append({
-            "role": "assistant",
-            "content": (
-                "I'm sorry, something went wrong while processing "
-                "your question. Please try again."
-            ),
-            "sources": []
-        })
-
-        st.error(f"Technical error: {e}")
-
-
-# --------------------------------------------------
+# =========================================================
 # SIDEBAR
-# --------------------------------------------------
+# =========================================================
 
 with st.sidebar:
 
-    st.markdown("""
-    <div style="padding:10px 0 20px 0;">
-        <div style="font-size:28px;font-weight:800;color:white;">
-            💼 ZYRO
-        </div>
-        <div style="font-size:12px;color:#9CA3AF;letter-spacing:2px;">
-            DYNAMICS HR PORTAL
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    show_logo()
 
     st.markdown("---")
 
-    if st.button("＋ New Chat", use_container_width=True):
-        create_new_chat()
+    if st.button("＋  New conversation", use_container_width=True):
+        st.session_state.active_chat = create_chat()
+        st.session_state.pending_question = None
         st.rerun()
 
-    st.markdown("### Your Conversations")
+    st.markdown("### Your conversations")
 
-    for i, chat in enumerate(st.session_state.chats):
-        label = "💬 " + chat["title"]
+    chats = get_all_chats()
+
+    if not chats:
+        st.caption("Your conversations will appear here.")
+
+    for chat_id, title in chats:
+
+        label = ("● " if chat_id == st.session_state.active_chat else "○ ") + title
 
         if st.button(
             label,
-            key=f"chat_{chat['id']}",
-            use_container_width=True
+            key=f"chat_{chat_id}",
+            use_container_width=True,
         ):
-            select_chat(i)
+            st.session_state.active_chat = chat_id
+            st.session_state.pending_question = None
             st.rerun()
 
-    # Download current conversation
-    current_chat = get_current_chat()
+    st.markdown("---")
 
-    st.download_button(
-        label="⬇ Download Current Chat",
-        data=build_chat_export(current_chat),
-        file_name="zyro_hr_chat.txt",
-        mime="text/plain",
-        use_container_width=True,
-        disabled=len(current_chat["messages"]) == 0
+    st.markdown("### Conversation tools")
+
+    current_messages = get_chat_messages(
+        st.session_state.active_chat
     )
+
+    if current_messages:
+
+        export_lines = [
+            "ZYRO DYNAMICS - HR POLICY ASSISTANT",
+            "=" * 45,
+            "",
+        ]
+
+        for msg in current_messages:
+            role = "You" if msg["role"] == "user" else "HR Assistant"
+
+            export_lines.append(f"{role}:")
+            export_lines.append(msg["content"])
+            export_lines.append("")
+
+            if msg["sources"]:
+                export_lines.append("Sources:")
+
+                for source in msg["sources"]:
+                    export_lines.append(
+                        f"- {source.get('source', 'Unknown')} "
+                        f"(Page {source.get('page', '?')})"
+                    )
+
+                export_lines.append("")
+
+            if msg["feedback"]:
+                export_lines.append(
+                    f"Feedback: {msg['feedback']}"
+                )
+                export_lines.append("")
+
+            export_lines.append("-" * 35)
+            export_lines.append("")
+
+        export_text = "\n".join(export_lines)
+
+        st.download_button(
+            "⬇  Download this chat",
+            data=export_text,
+            file_name="zyro_hr_conversation.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    else:
+        st.caption("Ask a question to enable chat export.")
+
+    if st.button("Clear current conversation", use_container_width=True):
+        clear_chat_messages(st.session_state.active_chat)
+        st.rerun()
 
     st.markdown("---")
 
-    st.markdown("### HR Help Desk")
-
-    page = st.radio(
-        "Navigation",
-        ["Assistant", "About Zyro"],
-        label_visibility="collapsed"
-    )
-
-    st.markdown("---")
-
-    st.markdown("""
-    <div style="background:#1F2937;padding:15px;border-radius:12px;">
-        <div style="color:#86EFAC;font-weight:600;font-size:13px;">
-            ● AI SYSTEM ACTIVE
-        </div>
-        <p style="color:#9CA3AF;font-size:12px;margin-top:6px;">
-            Powered by RAG technology
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div style="font-size:11px;color:#9CA3AF;margin-top:30px;">
-        Zyro Dynamics Pvt. Ltd.<br>
-        Internal HR Knowledge Assistant
-    </div>
-    """, unsafe_allow_html=True)
+    st.caption("Zyro Dynamics HR Help Desk")
+    st.caption("Powered by Retrieval-Augmented Generation")
 
 
-# --------------------------------------------------
-# ABOUT PAGE
-# --------------------------------------------------
+# =========================================================
+# MAIN HEADER
+# =========================================================
 
-if page == "About Zyro":
-
-    st.markdown("# About Zyro Dynamics")
-
-    st.markdown("""
-    <div class="hero">
-        <h1>Welcome to Zyro Dynamics</h1>
-        <p>
-            Your intelligent workplace assistant for HR policies,
-            employee information and organizational guidelines.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("### About this project")
-
-    st.write("""
-    The Zyro Dynamics Intelligent HR Help Desk is an AI-powered
-    knowledge assistant designed to help employees find answers
-    from official company HR policy documents.
-    """)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric("Policy Documents", "11")
-
-    with col2:
-        st.metric("AI Architecture", "RAG")
-
-    with col3:
-        st.metric("Vector Database", "FAISS")
-
-    st.markdown("### Technology Stack")
-
-    st.markdown("""
-    - **Frontend:** Streamlit
-    - **LLM:** Groq
-    - **Embeddings:** Sentence Transformers
-    - **Vector Database:** FAISS
-    - **Framework:** LangChain
-    - **Knowledge Base:** Zyro Dynamics HR policy PDFs
-    """)
-
-    st.info(
-        "This assistant provides information from available policy documents. "
-        "For official decisions or clarification, contact the HR team."
-    )
-
-    st.stop()
-
-
-# --------------------------------------------------
-# MAIN ASSISTANT PAGE
-# --------------------------------------------------
+show_logo()
 
 st.markdown("""
 <div class="hero">
-    <div style="font-size:13px;letter-spacing:2px;font-weight:600;">
-        ZYRO DYNAMICS • PEOPLE & CULTURE
-    </div>
-    <h1>Your Intelligent HR Assistant</h1>
+    <h1>Your HR knowledge, one conversation away.</h1>
     <p>
-        Ask questions about company policies, leave, compensation,
-        benefits and workplace guidelines.
+        Get answers from Zyro Dynamics HR policies.
+        Ask about leave, benefits, workplace policies,
+        performance and employee support.
     </p>
-    <span class="status">● Online and ready to help</span>
 </div>
 """, unsafe_allow_html=True)
 
 
-# --------------------------------------------------
-# QUICK ACTION CARDS
-# --------------------------------------------------
+# =========================================================
+# GENERAL DISCLAIMER
+# =========================================================
 
-chat = get_current_chat()
-
-if not chat["messages"]:
-
-    st.markdown("### How can I help you today?")
-    st.caption("Choose a topic or type your own question below.")
-
-    quick_questions = [
-        ("🏖️ Leave Policy", "How does my Earned Leave accrue every month?"),
-        ("🏠 Work From Home", "Am I eligible to work from home at my grade?"),
-        ("💰 Salary & Benefits", "What medical insurance coverage does the company provide?"),
-        ("📈 Performance", "When am I put on a Performance Improvement Plan?"),
-        ("🛡️ Code of Conduct", "Can I accept a gift from a client or vendor?"),
-        ("✈️ Travel Policy", "What are my hotel and daily allowances for international travel?")
-    ]
-
-    columns = st.columns(3)
-
-    for i, (label, question) in enumerate(quick_questions):
-        with columns[i % 3]:
-            if st.button(
-                label,
-                key=f"quick_{i}",
-                use_container_width=True
-            ):
-                st.session_state.pending_question = question
-                st.rerun()
-
-    st.markdown("---")
-    st.markdown("### Suggested questions")
-
-    suggestions = [
-        "How much Earned Leave can I carry forward?",
-        "What is the salary credit date?",
-        "How do I raise a POSH complaint?",
-        "What notice period do I need to serve?"
-    ]
-
-    cols = st.columns(2)
-
-    for i, question in enumerate(suggestions):
-        with cols[i % 2]:
-            if st.button(
-                "↗ " + question,
-                key=f"suggest_{i}",
-                use_container_width=True
-            ):
-                st.session_state.pending_question = question
-                st.rerun()
+st.markdown("""
+<div class="hr-disclaimer">
+    <b>Important HR notice</b><br>
+    Answers are generated from the available HR policy documents
+    and are intended for general guidance. They are not official
+    HR approvals or decisions. Confirm individual eligibility,
+    exceptions, interpretations and important employment decisions
+    with the HR team.
+</div>
+""", unsafe_allow_html=True)
 
 
-# --------------------------------------------------
+# =========================================================
+# QUICK QUESTIONS
+# =========================================================
+
+st.markdown("### What would you like to know?")
+
+quick_questions = [
+    "How does Earned Leave accrue?",
+    "What is the work-from-home policy?",
+    "What medical benefits are provided?",
+    "What is the notice period?",
+    "How do I raise a POSH complaint?",
+    "What are the performance review timelines?",
+]
+
+cols = st.columns(3)
+
+for i, question in enumerate(quick_questions):
+
+    with cols[i % 3]:
+
+        if st.button(
+            question,
+            key=f"quick_{i}",
+            use_container_width=True,
+        ):
+            st.session_state.pending_question = question
+            st.rerun()
+
+
+st.markdown("---")
+
+
+# =========================================================
 # DISPLAY CHAT HISTORY
-# --------------------------------------------------
+# =========================================================
 
-chat = get_current_chat()
+messages = get_chat_messages(
+    st.session_state.active_chat
+)
 
-for message in chat["messages"]:
+for message in messages:
 
     with st.chat_message(message["role"]):
 
@@ -512,50 +605,185 @@ for message in chat["messages"]:
 
         if message["role"] == "assistant":
 
-            sources = message.get("sources", [])
+            if message["sources"]:
 
-            if sources:
                 with st.expander("📚 View policy sources"):
-                    for source in sources:
+
+                    for source in message["sources"]:
                         st.markdown(
-                            f'<div class="citation">📄 {source}</div>',
-                            unsafe_allow_html=True
+                            f"**{source.get('source', 'Unknown')}** "
+                            f"— Page {source.get('page', '?')}"
                         )
 
+            st.markdown("""
+            <div class="hr-disclaimer">
+                <b>HR confirmation:</b>
+                This answer is policy-based guidance. Confirm
+                individual circumstances, exceptions and approvals
+                with the HR team.
+            </div>
+            """, unsafe_allow_html=True)
 
-# --------------------------------------------------
-# PROCESS QUICK QUESTION
-# --------------------------------------------------
+            st.markdown(
+                '<div class="feedback-label">Was this answer helpful?</div>',
+                unsafe_allow_html=True,
+            )
+
+            col1, col2, col3 = st.columns([1, 1, 5])
+
+            with col1:
+                if st.button(
+                    "👍 Helpful",
+                    key=f"helpful_{message['id']}",
+                ):
+                    save_feedback(message["id"], "Helpful")
+                    st.rerun()
+
+            with col2:
+                if st.button(
+                    "👎 Not Helpful",
+                    key=f"not_helpful_{message['id']}",
+                ):
+                    save_feedback(message["id"], "Not Helpful")
+                    st.rerun()
+
+            if message["feedback"]:
+                st.caption(
+                    f"Your feedback: {message['feedback']}"
+                )
+
+
+# =========================================================
+# PROCESS QUESTION
+# =========================================================
+
+question = st.chat_input(
+    "Ask anything about Zyro Dynamics HR policies..."
+)
 
 if st.session_state.pending_question:
 
     question = st.session_state.pending_question
     st.session_state.pending_question = None
 
-    process_question(question)
+
+if question:
+
+    chat_id = st.session_state.active_chat
+
+    # Save user question
+    save_message(
+        chat_id,
+        "user",
+        question,
+    )
+
+    # Update conversation title for its first question
+    existing_messages = get_chat_messages(chat_id)
+
+    if len(existing_messages) == 1:
+        update_chat_title(chat_id, question)
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+
+        with st.spinner(
+            "Searching HR policy documents..."
+        ):
+
+            try:
+
+                result = answer_question(
+                    question,
+                    retriever,
+                    chain,
+                )
+
+                answer = result["answer"]
+                sources = result.get("sources", [])
+
+                st.markdown(answer)
+
+                if sources:
+
+                    with st.expander("📚 View policy sources"):
+
+                        for source in sources:
+                            st.markdown(
+                                f"**{source.get('source', 'Unknown')}** "
+                                f"— Page {source.get('page', '?')}"
+                            )
+
+                st.markdown("""
+                <div class="hr-disclaimer">
+                    <b>HR confirmation:</b>
+                    This answer is based on available policy documents.
+                    Confirm individual eligibility, exceptions,
+                    approvals and important decisions with HR.
+                </div>
+                """, unsafe_allow_html=True)
+
+                message_id = save_message(
+                    chat_id,
+                    "assistant",
+                    answer,
+                    sources,
+                )
+
+                st.markdown(
+                    '<div class="feedback-label">Was this answer helpful?</div>',
+                    unsafe_allow_html=True,
+                )
+
+                col1, col2 = st.columns([1, 1])
+
+                with col1:
+                    if st.button(
+                        "👍 Helpful",
+                        key=f"new_helpful_{message_id}",
+                    ):
+                        save_feedback(message_id, "Helpful")
+                        st.rerun()
+
+                with col2:
+                    if st.button(
+                        "👎 Not Helpful",
+                        key=f"new_not_helpful_{message_id}",
+                    ):
+                        save_feedback(message_id, "Not Helpful")
+                        st.rerun()
+
+            except Exception:
+
+                error_message = (
+                    "I couldn't complete your request right now. "
+                    "Please check the model service and credentials, "
+                    "then try again."
+                )
+
+                st.error(error_message)
+
+                save_message(
+                    chat_id,
+                    "assistant",
+                    error_message,
+                )
+
+                if os.getenv("DEBUG", "").lower() == "true":
+                    st.exception(Exception("Question processing failed."))
+
     st.rerun()
 
 
-# --------------------------------------------------
-# CHAT INPUT
-# --------------------------------------------------
-
-user_question = st.chat_input(
-    "Ask anything about Zyro Dynamics HR policies..."
-)
-
-if user_question:
-    process_question(user_question)
-    st.rerun()
-
-
-# --------------------------------------------------
+# =========================================================
 # FOOTER
-# --------------------------------------------------
+# =========================================================
 
 st.markdown("""
 <div class="footer">
-    Powered by AI • Zyro Dynamics Pvt. Ltd.<br>
-    Your intelligent HR policy assistant
+    ZYRO DYNAMICS · HR POLICY ASSISTANT<br>
+    AI-powered policy assistance | Always verify important decisions with HR
 </div>
 """, unsafe_allow_html=True)

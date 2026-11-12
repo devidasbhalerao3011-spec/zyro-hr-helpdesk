@@ -1,18 +1,14 @@
 .env
 .streamlit/secrets.toml
-
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
 .venv/
 venv/
-
 faiss_index/
-
 data/hr_policies/*.pdf
-
 submission.csv
+.ipynb_checkpoints/
 test.csv
-
-*_backup.py
+# Local databases
+*.db
