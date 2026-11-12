@@ -1,0 +1,12 @@
+streamlit>=1.36,<2
+langchain>=0.2.16,<1
+langchain-community>=0.2.16,<1
+langchain-core>=0.2.38,<1
+langchain-text-splitters>=0.2.4,<1
+langchain-groq>=0.1.9
+langchain-huggingface>=0.0.3
+sentence-transformers>=3.0
+faiss-cpu>=1.8.0
+pypdf>=4.3
+python-dotenv>=1.0
+pandas>=2.2
